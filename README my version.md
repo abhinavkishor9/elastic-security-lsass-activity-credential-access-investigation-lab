@@ -104,179 +104,377 @@ The scenario is designed to demonstrate how a SOC analyst investigates **Windows
 
 ---
 
-## Host Information
+## Baseline
 
-- Hostname: `DESKTOP-9MMM37V`
-- User: `desktop-9mmm37v\dell`
-- User Profile: `C:\Users\Dell`
-- Domain: `WORKGROUP`
-- Domain Role: `0`
-- Wazuh Agent ID: `001`
-- Wazuh Agent Name: `DESKTOP-9MMM37V`
-- Investigation Directory: `C:\DPAPILab\Evidence`
+Before creating the test service, the analyst checked:
 
----
+```powershell
+Get-Service -Name "ElasticLab07" -ErrorAction SilentlyContinue
+```
 
-## DPAPI Artifact Investigation
+No existing `ElasticLab07` service was found.
 
-The primary user-level DPAPI location investigated was:
+A sample of existing Windows services was also reviewed to provide environmental context.
 
-`C:\Users\Dell\AppData\Roaming\Microsoft\Protect`
+## Service Creation
 
-The directory existed and contained:
+The following command created the controlled service:
 
-- A user SID-named directory
-- `CREDHIST`
+```powershell
+sc.exe create ElasticLab07 binPath= "C:\Windows\System32\cmd.exe /c exit" start= demand DisplayName= "Elastic Lab 07 Test Service"
+```
 
-The observed SID-named directory was:
+Windows returned:
 
-`S-1-5-21-51198790-337801975-3228388354-1001`
+```text
+[SC] CreateService SUCCESS
+```
 
-The presence of these artifacts confirms that DPAPI-related material exists within the user profile.
+## Service Configuration
 
-However, these artifacts are not sufficient to establish credential theft or malicious DPAPI access.
+The service was inspected with:
 
----
+```powershell
+sc.exe qc ElasticLab07
+```
 
-## Machine Cryptographic Artifacts
+Observed configuration:
 
-The investigation also examined:
+```text
+SERVICE_NAME: ElasticLab07
+TYPE: 10 WIN32_OWN_PROCESS
+START_TYPE: 3 DEMAND_START
+ERROR_CONTROL: 1 NORMAL
+BINARY_PATH_NAME: C:\Windows\System32\cmd.exe /c exit
+DISPLAY_NAME: Elastic Lab 07 Test Service
+SERVICE_START_NAME: LocalSystem
+```
 
-`C:\ProgramData\Microsoft\Crypto`
+The service was also checked with:
 
-The following entries were observed:
+```powershell
+Get-Service -Name "ElasticLab07" | Select-Object Name, DisplayName, Status, StartType
+```
 
-- `PCPKSP`
-- `RSA`
+Observed:
 
-These locations were documented as part of the Windows cryptographic environment.
+```text
+Name         : ElasticLab07
+DisplayName  : Elastic Lab 07 Test Service
+Status       : Stopped
+StartType    : Manual
+```
 
-Their presence alone was not treated as suspicious.
+## Service State
 
----
+The detailed service query showed:
+
+```text
+Status: Ready
+Run As User: Dell
+Task To Run: N/A
+```
+
+For the Windows Service configuration itself, `sc.exe qc` reported:
+
+```text
+SERVICE_START_NAME: LocalSystem
+```
+
+The investigation therefore records the service configuration exactly as reported by Windows rather than assuming the interactive user context represents the service account.
+
+## Elastic Process Telemetry
+
+The following ES|QL query was used to locate activity associated with the service name:
+
+```esql
+FROM logs-*
+| WHERE process.command_line LIKE "*ElasticLab07*"
+| KEEP @timestamp, host.name, user.name, process.name, process.pid, process.parent.name, process.parent.pid, process.command_line, process.executable
+| SORT @timestamp DESC
+```
+
+Elastic returned process events for `sc.exe`.
+
+### Service Creation Event
+
+Observed:
+
+```text
+Sep 26, 2026 @ 05:54:16.453
+```
+
+Process:
+
+```text
+sc.exe
+```
+
+PID:
+
+```text
+29604
+```
+
+Parent:
+
+```text
+pwsh.exe
+```
+
+Parent PID:
+
+```text
+33488
+```
+
+The command line contained:
+
+```text
+sc.exe create ElasticLab07
+```
+
+The executable path was:
+
+```text
+C:\Windows\System32\sc.exe
+```
+
+## Service Query Activity
+
+Additional `sc.exe` activity was captured.
+
+Observed:
+
+```text
+Sep 26, 2026 @ 05:55:46.557
+```
+
+Process:
+
+```text
+sc.exe
+```
+
+PID:
+
+```text
+33872
+```
+
+Parent:
+
+```text
+pwsh.exe
+```
+
+Parent PID:
+
+```text
+33488
+```
+
+The command line contained:
+
+```text
+sc.exe qc ElasticLab07
+```
+
+This demonstrates that Elastic captured service-management activity performed from PowerShell.
+
+## Binary Path Investigation
+
+A focused search for the service binary path was performed:
+
+```esql
+FROM logs-*
+| WHERE process.command_line LIKE "*cmd.exe /c exit*"
+| KEEP @timestamp, host.name, user.name, process.name, process.parent.name, process.command_line, process.executable
+| SORT @timestamp DESC
+```
+
+Elastic returned one result associated with:
+
+```text
+sc.exe
+```
+
+The command line referenced the service creation operation.
+
+This provided process-level evidence that the service was configured using the intended binary path.
 
 ## Registry Investigation
 
-The investigation checked:
+The service configuration was also examined locally at:
 
-`HKCU:\Software\Microsoft\Cryptography`
+```text
+HKLM:\SYSTEM\CurrentControlSet\Services\ElasticLab07
+```
 
-It also checked:
+The following command was used:
 
-`HKCU:\Software\Microsoft\Protect`
+```powershell
+Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\ElasticLab07"
+```
 
-The `HKCU:\Software\Microsoft\Protect` path returned `False`.
+Observed:
 
-This was documented as a negative finding rather than treated as an investigation failure.
+```text
+Type: 16
+Start: 3
+ErrorControl: 1
+ImagePath: C:\Windows\System32\cmd.exe /c exit
+DisplayName: Elastic Lab 07 Test Service
+ObjectName: LocalSystem
+```
 
----
+The Registry key itself was also verified.
 
-## Sysmon Investigation
+## Elastic Registry Hunt
 
-Sysmon Event ID `1` process creation events were searched for the following terms:
+A Registry query was attempted:
 
-- `dpapi`
-- `protect`
-- `cryptprotect`
-- `credential`
-- `vault`
-- `lsass`
+```esql
+FROM logs-*
+| WHERE registry.key LIKE "*CurrentControlSet*Services*"
+| WHERE registry.value LIKE "*ElasticLab07*"
+| KEEP @timestamp, host.name, user.name, registry.key, registry.value, registry.data.strings
+| SORT @timestamp DESC
+```
 
-The search returned four matching process creation events.
+Result:
 
-Observed timestamps included:
+```text
+0 documents processed
+```
 
-- `27-09-2026 05:54:01`
-- `27-09-2026 05:56:13`
-- `27-09-2026 05:58:21`
-- `27-09-2026 05:58:21`
+No Registry telemetry matching those conditions was returned.
 
-These events demonstrate that process telemetry matched the investigation keywords.
+The local Registry evidence therefore remains authoritative for the configuration that was actually present on the endpoint, while the absence of Elastic Registry results is documented as a telemetry limitation.
 
-They do not, by themselves, prove that a process was performing credential theft or malicious DPAPI operations.
+## Service Execution
 
----
+The service was configured as:
 
-## Wazuh `net.exe` Investigation
+```text
+DEMAND_START
+```
 
-Wazuh reported a process event involving:
+and:
 
-`C:\Windows\SysWOW64\net.exe`
+```text
+STOPPED
+```
 
-The exact command line was:
+The controlled service was not used to execute a malicious payload.
 
-`net.exe accounts`
+The investigation therefore focused primarily on:
 
-Additional event information included:
+```text
+Service Creation
+Service Configuration
+Service Account
+Binary Path
+Elastic sc.exe Telemetry
+```
 
-- Company: `Microsoft Corporation`
-- Description: `Net Command`
-- Integrity Level: `System`
-- Original File Name: `net.exe`
-- Parent Process: `C:\Program Files (x86)\ossec-agent\wazuh-agent.exe`
+rather than attempting unnecessary service execution.
 
-The command line was particularly important because the investigation should focus on what `net.exe` actually executed rather than treating every occurrence of `net.exe` as malicious.
+## Key Findings
 
-The parent process was also reviewed because process ancestry can provide important context.
+### Observed
 
----
-
-## Evidence Assessment
+- `ElasticLab07` was created successfully.
+- The service was configured as `DEMAND_START`.
+- The service status was `STOPPED`.
+- The binary path was `C:\Windows\System32\cmd.exe /c exit`.
+- The service display name was `Elastic Lab 07 Test Service`.
+- The configured service account was `LocalSystem`.
+- Elastic captured the `sc.exe create` activity.
+- Elastic captured subsequent `sc.exe query` and `sc.exe qc` activity.
+- The `ElasticLab07` Registry hunt returned no results in Elastic.
+- Local Registry inspection confirmed the service configuration.
+- The service was successfully deleted.
 
 ### Confirmed
 
-- The endpoint contains a DPAPI user-profile directory.
-- A user SID-named DPAPI directory exists.
-- `CREDHIST` exists within the DPAPI location.
-- Machine-level cryptographic directories exist.
-- Sysmon process creation events matched DPAPI-related investigation keywords.
-- Wazuh recorded execution of `net.exe`.
-- The observed `net.exe` command line was `net.exe accounts`.
-- The Wazuh event identified `wazuh-agent.exe` as the parent process.
+- The controlled Windows Service existed.
+- The service configuration was validated locally.
+- The service creation command was captured by Elastic.
+- The service management process was `sc.exe`.
+- The service configuration referenced the intended executable path.
+- The service was removed during remediation.
 
-### Not Confirmed
+### Not Demonstrated
 
-The available evidence does not establish:
+- Malicious service execution
+- Malware execution
+- Credential theft
+- Privilege escalation
+- Command-and-control
+- Defense evasion
+- Confirmed endpoint compromise
 
-- Credential theft.
-- DPAPI secret extraction.
-- Malicious DPAPI decryption.
-- LSASS credential dumping.
-- Confirmed account compromise.
-- Malicious persistence.
-- Confirmed attacker activity.
+## Telemetry Limitations
 
----
+The investigation identified several telemetry limitations:
 
-## MITRE ATT&CK Mapping
-
-The investigation has potential relevance to credential-access techniques involving Windows credential stores and protected credentials.
-
-Potentially relevant techniques include:
-
-- **T1555 - Credentials from Password Stores**
-- **T1555.004 - Credentials from Password Stores: Windows Credential Manager**
-- **T1003 - OS Credential Dumping**
-
-These techniques are included as investigative considerations rather than confirmed detections.
-
-The presence of DPAPI artifacts or credential-related keywords is not sufficient to claim that any of these techniques were successfully executed.
-
-Further behavioral evidence would be required.
-
----
+- The Registry-specific Elastic query returned zero documents.
+- Some `sc.exe` events contained incomplete PID, parent-process, or command-line fields.
+- The service configuration was therefore validated primarily through local Windows commands.
+- Service configuration evidence does not automatically prove that the configured binary executed.
+- The process that created the service should not automatically be treated as the eventual service process.
 
 
-## Evidence Collected
+## MITRE ATT&CK
 
-The investigation generated the following evidence files:
+### T1543.003 — Create or Modify System Process: Windows Service
 
-- `Host-Identity.txt`
-- `DPAPI-Profile-Artifacts.txt`
-- `DPAPI-Registry-Artifacts.txt`
-- `DPAPI-Timeline.txt`
-- `Sysmon-DPAPI-ProcessActivity.txt`
-- `Investigation-Summary.txt`
+The controlled activity demonstrates Windows Service creation and configuration.
 
----
+The ATT&CK mapping describes the mechanism demonstrated by the lab and does not indicate that the controlled service itself was malicious.
+
+## Remediation
+
+The controlled service was removed using:
+
+```powershell
+sc.exe delete ElasticLab07
+```
+
+Windows returned:
+
+```text
+[SC] DeleteService SUCCESS
+```
+
+Post-deletion verification was performed with:
+
+```powershell
+Get-Service -Name "ElasticLab07" -ErrorAction SilentlyContinue
+```
+
+and:
+
+```powershell
+sc.exe query ElasticLab07
+```
+
+The service query returned:
+
+```text
+The specified service does not exist as an installed service.
+```
+
+The Registry was also checked:
+
+```powershell
+Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\ElasticLab07"
+```
+
+Result:
+
+```text
+False
+```
 
